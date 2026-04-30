@@ -9,6 +9,28 @@ Install the Grafana dashboard by importing the JSON file `cohesity_grafana_dashb
 
 ![Cohesity Grafana dashboard](grafana-example.png)
 
+## Installation
+
+Build and run with Docker:
+
+```
+docker build -t cohesity-prometheus-exporter .
+
+docker run -d \
+    -p 1234:1234 \
+    -e PUID=1000 \
+    -e PGID=1000 \
+    -e COHESITY_VIP=LocalCohesityVIP.domain.com \
+    -e COHESITY_USER=YourLogin \
+    -e CPE_STATS_ENABLED=1 \
+    -e CPE_ENABLE_NODE_DETAIL=1 \
+    -e CPE_NODE_DETAIL_REFRESH_SECONDS=120 \
+    --name cpe \
+    ghcr.io/teebee-camx/cohesity-prometheus-exporter:latest \
+    -d local \
+    -pwd 'Sup3rS3cr3t' \
+    -port 1234
+```
 
 Fetch metrics:
 
