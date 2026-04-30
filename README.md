@@ -7,6 +7,9 @@ Use metrics from the Cohesity REST API to export relevant metrics to Prometheus
 
 Install the Grafana dashboard by importing the JSON file `cohesity_grafana_dashboard.json`.
 
+![Cohesity Grafana dashboard](grafana-example.png)
+
+
 Fetch metrics:
 
 ```
