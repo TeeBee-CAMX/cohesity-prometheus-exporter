@@ -1,6 +1,12 @@
 # cohesity-prometheus-exporter
 A metrics collector that exports metrics from your local cohesity cluster and outputs them in a format that can be ingested by Prometheus
 
+## Overview
+
+Use metrics from the Cohesity REST API to export relevant metrics to Prometheus
+
+Install the Grafana dashboard by importing the JSON file `cohesity_grafana_dashboard.json`.
+
 Fetch metrics:
 
 ```
