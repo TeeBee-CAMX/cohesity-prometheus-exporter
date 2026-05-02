@@ -1702,5 +1702,3 @@ if __name__ == "__main__":
     log(f"starting OpenMetrics exporter on port {port}")
     server = ThreadingHTTPServer(("", port), OpenMetricsHandler)
     server.serve_forever()
-cpe_job_runs_wired.txt
-Displaying cpe_job_runs_wired.txt. 
