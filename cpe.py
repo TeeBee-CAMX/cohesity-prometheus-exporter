@@ -1,3 +1,20 @@
+None selected 
+
+Skip to content
+Using THB Mail with screen readers
+
+15 of 11,083
+cpe
+Inbox
+
+Tim Brown <tim@virtualization-blog.com>
+Attachments
+9:05 AM (14 hours ago)
+to me
+
+
+ One attachment
+  •  Scanned by Gmail
 #!/usr/bin/env python3
 """
 Cohesity Prometheus/OpenMetrics exporter
@@ -37,6 +54,8 @@ ALERTS_REFRESH_SECONDS = int(os.environ.get("CPE_ALERTS_REFRESH_SECONDS", "120")
 JOBS_REFRESH_SECONDS = int(os.environ.get("CPE_JOBS_REFRESH_SECONDS", "600"))
 SOURCES_REFRESH_SECONDS = int(os.environ.get("CPE_SOURCES_REFRESH_SECONDS", "600"))
 JOB_RUNS_REFRESH_SECONDS = int(os.environ.get("CPE_JOB_RUNS_REFRESH_SECONDS", "600"))
+JOB_RUN_LOOKBACK_HOURS = int(os.environ.get("CPE_JOB_RUN_LOOKBACK_HOURS", "48"))
+JOB_RUNS_LIMIT_PER_JOB = int(os.environ.get("CPE_JOB_RUNS_LIMIT_PER_JOB", "1"))
 NODE_STATS_REFRESH_SECONDS = int(os.environ.get("CPE_NODE_STATS_REFRESH_SECONDS", "300"))
 
 # Confirmed batched v1 public node stats endpoint:
@@ -575,18 +594,30 @@ def get_sources(client):
 
 
 def get_runs_for_job(client, job_id):
-    if not job_id or job_id == "unknown":
+    if not job_id or str(job_id) == "unknown":
         return []
+
+    start_usecs = int((time.time() - (JOB_RUN_LOOKBACK_HOURS * 3600)) * 1_000_000)
     payload = try_api_get(
         client,
         [
-            (f"/irisservices/api/v2/data-protect/protection-groups/{job_id}/runs", {"numRuns": 20}),
-            ("/irisservices/api/v1/public/protectionRuns", {"jobId": job_id, "numRuns": 20}),
-            ("/protectionRuns", {"jobId": job_id, "numRuns": 20}),
+            ("/irisservices/api/v1/public/protectionRuns", {"jobId": str(job_id), "numRuns": str(JOB_RUNS_LIMIT_PER_JOB), "startTimeUsecs": str(start_usecs)}),
+            ("/irisservices/api/v1/public/protectionRuns", {"jobId": str(job_id), "numRuns": str(JOB_RUNS_LIMIT_PER_JOB)}),
+            (f"/irisservices/api/v2/data-protect/protection-groups/{job_id}/runs", {"numRuns": str(JOB_RUNS_LIMIT_PER_JOB)}),
+            ("/protectionRuns", {"jobId": str(job_id), "numRuns": str(JOB_RUNS_LIMIT_PER_JOB)}),
         ],
         metric_name=f"job_runs_{job_id}",
     )
-    return _walk_list(payload)
+    runs = _walk_list(payload)
+    if not runs and isinstance(payload, dict):
+        for key in ["runs", "protectionRuns", "backupRuns", "items", "data"]:
+            if isinstance(payload.get(key), list):
+                runs = _walk_list(payload[key])
+                break
+    runs.sort(key=lambda r: _job_run_start_seconds(r), reverse=True)
+    if JOB_RUNS_LIMIT_PER_JOB > 0:
+        runs = runs[:JOB_RUNS_LIMIT_PER_JOB]
+    return runs
 
 
 def get_cluster_summary(client, nodes=None, alerts=None, jobs=None):
@@ -689,6 +720,127 @@ def get_cluster_summary(client, nodes=None, alerts=None, jobs=None):
 
 def job_name(job):
     return _label_safe(_first_present(job, ["name", "jobName", "protectionGroupName"]))
+
+
+
+def _nested_get(obj, path, default=None):
+    cur = obj
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            return default
+        if cur is None:
+            return default
+    return cur
+
+
+def _first_nested(obj, paths, default=None):
+    for path in paths:
+        value = _nested_get(obj, path, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _status_success(status):
+    s = _label_safe(status).lower()
+    return 1.0 if s in ["ksuccess", "success", "succeeded", "successful", "kfinished", "finished"] else 0.0
+
+
+def _status_failed(status):
+    s = _label_safe(status).lower()
+    return 1.0 if any(tok in s for tok in ["fail", "error", "cancel", "abort", "miss"]) else 0.0
+
+
+def _to_epoch_seconds_from_maybe_usecs(value):
+    raw = _to_float(value, 0.0)
+    if raw <= 0:
+        return 0.0
+    if raw > 10_000_000_000_000:
+        return raw / 1_000_000.0
+    if raw > 10_000_000_000:
+        return raw / 1_000.0
+    return raw
+
+
+def _duration_seconds_from_maybe_usecs(value):
+    raw = _to_float(value, 0.0)
+    if raw <= 0:
+        return 0.0
+    if raw > 10_000_000:
+        return raw / 1_000_000.0
+    if raw > 10_000:
+        return raw / 1_000.0
+    return raw
+
+
+def _job_run_container(run):
+    if not isinstance(run, dict):
+        return {}
+    for key in ["backupRun", "copyRun", "archivalRun", "replicationRun", "run"]:
+        if isinstance(run.get(key), dict):
+            return run[key]
+    return run
+
+
+def _job_run_start_seconds(run):
+    container = _job_run_container(run)
+    return _to_epoch_seconds_from_maybe_usecs(_first_nested(run, [
+        ["backupRun", "stats", "startTimeUsecs"],
+        ["backupRun", "startTimeUsecs"],
+        ["backupRun", "runStartTimeUsecs"],
+        ["stats", "startTimeUsecs"],
+        ["startTimeUsecs"],
+        ["runStartTimeUsecs"],
+        ["startTimeMsecs"],
+        ["runStartTimeMsecs"],
+    ], _first_present(container, ["startTimeUsecs", "runStartTimeUsecs", "startTimeMsecs"], 0)))
+
+
+def _job_run_end_seconds(run):
+    container = _job_run_container(run)
+    return _to_epoch_seconds_from_maybe_usecs(_first_nested(run, [
+        ["backupRun", "stats", "endTimeUsecs"],
+        ["backupRun", "endTimeUsecs"],
+        ["backupRun", "runEndTimeUsecs"],
+        ["stats", "endTimeUsecs"],
+        ["endTimeUsecs"],
+        ["runEndTimeUsecs"],
+        ["endTimeMsecs"],
+        ["runEndTimeMsecs"],
+    ], _first_present(container, ["endTimeUsecs", "runEndTimeUsecs", "endTimeMsecs"], 0)))
+
+
+def _job_run_status(run):
+    container = _job_run_container(run)
+    return _label_safe(_first_nested(run, [
+        ["backupRun", "status"],
+        ["status"],
+        ["runStatus"],
+        ["backupRun", "runStatus"],
+        ["copyRun", "status"],
+    ], _first_present(container, ["status", "runStatus"], "unknown")))
+
+
+def _job_run_stats_value(run, keys, default=0.0):
+    container = _job_run_container(run)
+    stats = container.get("stats", {}) if isinstance(container, dict) else {}
+    paths = []
+    for key in keys:
+        paths.extend([["backupRun", "stats", key], ["stats", key], [key]])
+    value = _first_nested(run, paths, None)
+    if value is None and isinstance(stats, dict):
+        for key in keys:
+            if key in stats:
+                value = stats[key]
+                break
+    if value is None and isinstance(container, dict):
+        for key in keys:
+            if key in container:
+                value = container[key]
+                break
+    return _to_float(value, default)
 
 
 def job_id(job):
@@ -1122,6 +1274,68 @@ class MetricsBuilder:
                 gm.add_metric(common + [jn, jid, env, "paused"], float(job_is_paused(job)))
             metrics.append(gm)
 
+
+            job_runs = data.get("job_runs", {}) or {}
+
+            gm = GaugeMetricFamily(
+                "cohesity_job_runs_cached_total",
+                "Number of jobs with latest run data cached by the exporter",
+                labels=common_labels,
+            )
+            gm.add_metric(common, float(len(job_runs)))
+            metrics.append(gm)
+
+
+            run_specs = [
+                ("cohesity_job_last_run_success", "1 if the latest protection run was successful", "last_status_success"),
+                ("cohesity_job_last_run_failed", "1 if the latest protection run failed/cancelled/errored", "last_status_failed"),
+                ("cohesity_job_last_run_start_timestamp_seconds", "Unix timestamp for latest protection run start", "last_run_start_timestamp_seconds"),
+                ("cohesity_job_last_run_end_timestamp_seconds", "Unix timestamp for latest protection run end", "last_run_end_timestamp_seconds"),
+                ("cohesity_job_last_run_age_seconds", "Age in seconds since latest protection run started", "last_run_age_seconds"),
+                ("cohesity_job_last_run_duration_seconds", "Latest protection run duration in seconds from timeTakenUsecs", "last_run_duration_seconds"),
+                ("cohesity_job_last_run_source_bytes", "Latest protection run total source size bytes", "last_run_source_bytes"),
+                ("cohesity_job_last_run_bytes_read", "Latest protection run total bytes read from source", "last_run_bytes_read"),
+                ("cohesity_job_last_run_bytes_to_read", "Latest protection run total bytes to read from source", "last_run_bytes_to_read"),
+                ("cohesity_job_last_run_logical_bytes", "Latest protection run total logical backup size bytes", "last_run_logical_bytes"),
+                ("cohesity_job_last_run_physical_bytes", "Latest protection run total physical backup size bytes", "last_run_physical_bytes"),
+                ("cohesity_job_last_run_successful_tasks", "Successful task count for latest protection run", "last_run_successful_tasks"),
+                ("cohesity_job_last_run_failed_tasks", "Failed task count for latest protection run", "last_run_failed_tasks"),
+                ("cohesity_job_last_run_canceled_tasks", "Canceled task count for latest protection run", "last_run_canceled_tasks"),
+                ("cohesity_job_last_run_successful_app_objects", "Successful app object count for latest protection run", "last_run_successful_app_objects"),
+                ("cohesity_job_last_run_failed_app_objects", "Failed app object count for latest protection run", "last_run_failed_app_objects"),
+                ("cohesity_job_last_run_canceled_app_objects", "Canceled app object count for latest protection run", "last_run_canceled_app_objects"),
+            ]
+
+            for metric_name, metric_help, key in run_specs:
+                gm = GaugeMetricFamily(
+                    metric_name,
+                    metric_help,
+                    labels=common_labels + ["job", "job_id", "status"],
+                )
+                for jid, run_data in job_runs.items():
+                    if not isinstance(run_data, dict):
+                        continue
+                    job_label = _label_safe(run_data.get("job", jid))
+                    status_label = _label_safe(run_data.get("last_status", "unknown"))
+                    gm.add_metric(common + [job_label, str(jid), status_label], _to_float(run_data.get(key), 0.0))
+                metrics.append(gm)
+
+            gm = GaugeMetricFamily(
+                "cohesity_job_runs_by_status",
+                "Recent protection run count by job and status within fetched run window",
+                labels=common_labels + ["job", "job_id", "status"],
+            )
+            for jid, run_data in job_runs.items():
+                if not isinstance(run_data, dict):
+                    continue
+                job_label = _label_safe(run_data.get("job", jid))
+                counts = run_data.get("counts", {}) or {}
+                for status, count in counts.items():
+                    gm.add_metric(common + [job_label, str(jid), _label_safe(status)], _to_float(count, 0.0))
+            metrics.append(gm)
+
+
+
             sources = data.get("sources", [])
             add_metric("cohesity_sources_total", "Total sources returned by the API", len(sources), common_labels, common)
 
@@ -1219,29 +1433,84 @@ class BackgroundRefresher(threading.Thread):
         results = {}
 
         def worker(job):
-            jid = job_id(job)
+            jid = str(job_id(job))
+            jname = job_name(job)
             runs = get_runs_for_job(self.client, jid)
+
             counts = {}
             latest_run = None
-            latest_ts = -1
+            latest_ts = -1.0
 
             for run in runs:
-                status = _label_safe(_first_present(run, ["status", "runStatus"]))
+                status = _job_run_status(run)
                 counts[status] = counts.get(status, 0) + 1
-                ts = _to_int(_first_present(run, ["startTimeUsecs", "startTime", "runStartTimeUsecs"]), 0)
+                ts = _job_run_start_seconds(run)
                 if ts > latest_ts:
                     latest_ts = ts
                     latest_run = run
 
-            success_value = 0
-            if latest_run is not None:
-                last_status = _label_safe(_first_present(latest_run, ["status", "runStatus"]))
-                success_value = 1 if last_status.lower() in ["success", "succeeded", "ksuccess"] else 0
+            if latest_run is None:
+                return jid, {
+                    "job": jname,
+                    "counts": counts,
+                    "last_status": "unknown",
+                    "last_status_success": 0.0,
+                    "last_status_failed": 0.0,
+                    "last_run_start_timestamp_seconds": 0.0,
+                    "last_run_end_timestamp_seconds": 0.0,
+                    "last_run_age_seconds": 0.0,
+                    "last_run_duration_seconds": 0.0,
+                    "last_run_source_bytes": 0.0,
+                    "last_run_bytes_read": 0.0,
+                    "last_run_bytes_to_read": 0.0,
+                    "last_run_logical_bytes": 0.0,
+                    "last_run_physical_bytes": 0.0,
+                    "last_run_successful_tasks": 0.0,
+                    "last_run_failed_tasks": 0.0,
+                    "last_run_canceled_tasks": 0.0,
+                    "last_run_successful_app_objects": 0.0,
+                    "last_run_failed_app_objects": 0.0,
+                    "last_run_canceled_app_objects": 0.0,
+                }
 
-            return str(jid), {
+            status = _job_run_status(latest_run)
+            start_s = _job_run_start_seconds(latest_run)
+            end_s = _job_run_end_seconds(latest_run)
+
+            # Confirmed from real protectionRuns output:
+            # backupRun.stats.timeTakenUsecs
+            duration_s = _duration_seconds_from_maybe_usecs(_job_run_stats_value(latest_run, [
+                "timeTakenUsecs",
+                "durationUsecs",
+                "durationMsecs",
+            ], 0.0))
+
+            if duration_s <= 0 and start_s > 0 and end_s > start_s:
+                duration_s = end_s - start_s
+
+            return jid, {
+                "job": jname,
                 "counts": counts,
-                "last_status_success": success_value,
-                "last_run_timestamp_usecs": latest_ts if latest_ts > 0 else 0,
+                "last_status": status,
+                "last_status_success": _status_success(status),
+                "last_status_failed": _status_failed(status),
+                "last_run_start_timestamp_seconds": start_s,
+                "last_run_end_timestamp_seconds": end_s,
+                "last_run_age_seconds": max(0.0, time.time() - start_s) if start_s > 0 else 0.0,
+
+                "last_run_duration_seconds": duration_s,
+                "last_run_source_bytes": _job_run_stats_value(latest_run, ["totalSourceSizeBytes"], 0.0),
+                "last_run_bytes_read": _job_run_stats_value(latest_run, ["totalBytesReadFromSource"], 0.0),
+                "last_run_bytes_to_read": _job_run_stats_value(latest_run, ["totalBytesToReadFromSource"], 0.0),
+                "last_run_logical_bytes": _job_run_stats_value(latest_run, ["totalLogicalBackupSizeBytes"], 0.0),
+                "last_run_physical_bytes": _job_run_stats_value(latest_run, ["totalPhysicalBackupSizeBytes"], 0.0),
+
+                "last_run_successful_tasks": _job_run_stats_value(latest_run, ["numSuccessfulTasks"], 0.0),
+                "last_run_failed_tasks": _job_run_stats_value(latest_run, ["numFailedTasks"], 0.0),
+                "last_run_canceled_tasks": _job_run_stats_value(latest_run, ["numCanceledTasks", "numCancelledTasks"], 0.0),
+                "last_run_successful_app_objects": _job_run_stats_value(latest_run, ["numSuccessfulAppObjects"], 0.0),
+                "last_run_failed_app_objects": _job_run_stats_value(latest_run, ["numFailedAppObjects"], 0.0),
+                "last_run_canceled_app_objects": _job_run_stats_value(latest_run, ["numCanceledAppObjects", "numCancelledAppObjects"], 0.0),
             }
 
         with ThreadPoolExecutor(max_workers=RUN_WORKERS) as pool:
@@ -1450,3 +1719,5 @@ if __name__ == "__main__":
     log(f"starting OpenMetrics exporter on port {port}")
     server = ThreadingHTTPServer(("", port), OpenMetricsHandler)
     server.serve_forever()
+cpe_job_runs_wired.txt
+Displaying cpe_job_runs_wired.txt. 
